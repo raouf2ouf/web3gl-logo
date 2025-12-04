@@ -1,0 +1,585 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Web3GL Logo</title>
+    </head>
+    <body>
+        <div class="logo-anim-wrapper">
+            <canvas id="logo-canvas"></canvas>
+        </div>
+    </body>
+
+    <style>
+        body {
+            background-color: #0a0a0a;
+        }
+        .logo-anim-wrapper {
+            position: relative;
+            width: 500px; /* adjust to your layout */
+            height: 500px;
+        }
+
+        #logo-canvas {
+            width: 100%;
+            height: 100%;
+            display: block;
+        }
+    </style>
+
+    <script>
+        (function () {
+            const LOGO_SRC = "./cork-logo-mask.webp"; // logo mask with alpha
+
+            // Simulation texture size: SIM_SIZE x SIM_SIZE pixels -> that many particles
+            const SIM_SIZE = 50; // 96x96 = 9216 particles
+            const PARTICLE_COUNT = SIM_SIZE * SIM_SIZE;
+
+            const canvas = document.getElementById("logo-canvas");
+            if (!canvas) return;
+
+            const gl = canvas.getContext("webgl");
+            if (!gl) {
+                console.error("WebGL not supported");
+                return;
+            }
+
+            // Resize canvas to match CSS size * devicePixelRatio
+            function resizeCanvas() {
+                const rect = canvas.getBoundingClientRect();
+                const dpr = window.devicePixelRatio || 1;
+                const width = rect.width * dpr;
+                const height = rect.height * dpr;
+
+                if (canvas.width !== width || canvas.height !== height) {
+                    canvas.width = width;
+                    canvas.height = height;
+                }
+            }
+            resizeCanvas();
+            window.addEventListener("resize", resizeCanvas);
+
+            // Float texture extensions
+            const extFloat = gl.getExtension("OES_texture_float");
+            const extColorFloat =
+                gl.getExtension("WEBGL_color_buffer_float") ||
+                gl.getExtension("EXT_color_buffer_float");
+
+            if (!extFloat || !extColorFloat) {
+                console.error(
+                    "Required float texture extensions not supported.",
+                );
+                return;
+            }
+
+            // Utils: shaders & program
+            function createShader(gl, type, src) {
+                const s = gl.createShader(type);
+                gl.shaderSource(s, src);
+                gl.compileShader(s);
+                if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+                    console.error(
+                        "Shader compile error:",
+                        gl.getShaderInfoLog(s),
+                        "\nSource:\n",
+                        src,
+                    );
+                    gl.deleteShader(s);
+                    return null;
+                }
+                return s;
+            }
+
+            function createProgram(gl, vsSrc, fsSrc) {
+                const vs = createShader(gl, gl.VERTEX_SHADER, vsSrc);
+                const fs = createShader(gl, gl.FRAGMENT_SHADER, fsSrc);
+                if (!vs || !fs) return null;
+                const prog = gl.createProgram();
+                gl.attachShader(prog, vs);
+                gl.attachShader(prog, fs);
+                gl.linkProgram(prog);
+                if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+                    console.error(
+                        "Program link error:",
+                        gl.getProgramInfoLog(prog),
+                    );
+                    gl.deleteProgram(prog);
+                    return null;
+                }
+                return prog;
+            }
+
+            // Fullscreen quad (for simulation pass)
+            const quadVerts = new Float32Array([
+                -1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1,
+            ]);
+            const quadVBO = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, quadVBO);
+            gl.bufferData(gl.ARRAY_BUFFER, quadVerts, gl.STATIC_DRAW);
+
+            // --- Simulation shaders (GPGPU: update positions & velocities) ---
+
+            const simVS = `
+             attribute vec2 a_position;
+             varying vec2 v_uv;
+             void main() {
+               v_uv = (a_position * 0.5) + 0.5; // [-1,1] -> [0,1]
+               gl_Position = vec4(a_position, 0.0, 1.0);
+             }
+           `;
+
+            const simFS = `
+                      precision highp float;
+                      varying vec2 v_uv;
+
+                      uniform sampler2D u_statePrev;
+                      uniform sampler2D u_logo;
+                      uniform vec2 u_canvasResolution; // not used but kept for compatibility
+                      uniform float u_dt;
+
+                      // Tunable params
+                      const float MOVE_SPEED   = 0.35;
+                      const float DAMPING      = 0.98;
+                      const float JITTER       = 0.03;
+                      const float BORDER_PUSH  = 0.25; // push back inside logo
+
+                      float logoAlpha(vec2 posNorm) {
+                        return texture2D(u_logo, posNorm).a;
+                      }
+
+                      vec2 logoGradient(vec2 posNorm) {
+                        float eps = 1.0 / 512.0;
+                        float c  = logoAlpha(posNorm);
+                        float cx = logoAlpha(posNorm + vec2(eps, 0.0));
+                        float cy = logoAlpha(posNorm + vec2(0.0, eps));
+                        return vec2(cx - c, cy - c);
+                      }
+
+                      float hash(vec2 p) {
+                        return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+                      }
+
+                      void main() {
+                        // old state: RGBA = (pos.x, pos.y, vel.x, vel.y), pos in 0..1
+                        vec4 s = texture2D(u_statePrev, v_uv);
+                        vec2 pos = s.xy;
+                        vec2 vel = s.zw;
+
+                        // small random jitter
+                        float t = hash(v_uv + pos);
+                        vec2 rnd = vec2(
+                          hash(v_uv + vec2(t, 0.173)),
+                          hash(v_uv + vec2(0.527, t))
+                        ) - 0.5;
+
+                        vel += rnd * JITTER;
+                        vel *= DAMPING;
+
+                        // tentative next position
+                        vec2 posNext = pos + vel * MOVE_SPEED * u_dt;
+                        posNext = clamp(posNext, vec2(0.0), vec2(1.0));
+
+                        // keep them inside logo by using alpha gradient
+                        float a = logoAlpha(posNext);
+                        if (a < 0.40) { // near/outside the border
+                          vec2 grad = logoGradient(posNext);
+                          float gMag = length(grad);
+                          if (gMag > 0.0001) {
+                            vec2 dirIn = normalize(grad);   // direction where alpha increases
+                            float strength = (0.40 - a);    // further out => stronger push
+                            posNext += dirIn * BORDER_PUSH * strength;
+                          }
+                        }
+
+                        posNext = clamp(posNext, vec2(0.0), vec2(1.0));
+
+                        gl_FragColor = vec4(posNext, vel);
+                      }
+                    `;
+
+            const simProgram = createProgram(gl, simVS, simFS);
+            if (!simProgram) return;
+            const simPosLoc = gl.getAttribLocation(simProgram, "a_position");
+            const simStatePrevLoc = gl.getUniformLocation(
+                simProgram,
+                "u_statePrev",
+            );
+            const simLogoLoc = gl.getUniformLocation(simProgram, "u_logo");
+            const simCanvasResLoc = gl.getUniformLocation(
+                simProgram,
+                "u_canvasResolution",
+            );
+            const simDtLoc = gl.getUniformLocation(simProgram, "u_dt");
+
+            // --- Render shaders (read positions from state texture + per-particle size) ---
+
+            const renderVS = `
+              precision highp float;
+
+              attribute vec2 a_uv;
+              attribute float a_size;
+              uniform sampler2D u_state;
+              uniform vec2 u_canvasResolution;
+
+              varying vec2 v_particleUv;   // MUST match fragment shader
+
+              void main() {
+                v_particleUv = a_uv;       // pass along to fragment
+
+                vec4 s = texture2D(u_state, a_uv);
+                vec2 posNorm = s.xy; // 0..1
+
+                vec2 posPixel = posNorm * u_canvasResolution;
+                vec2 zeroToOne = posPixel / u_canvasResolution;
+                vec2 clip = zeroToOne * 2.0 - 1.0;
+                clip.y = -clip.y;
+
+                gl_Position = vec4(clip, 0.0, 1.0);
+                gl_PointSize = a_size;
+              }
+            `;
+
+            const renderFS = `
+              precision highp float;
+
+              varying vec2 v_particleUv;   // SAME name & type as in vertex shader
+
+              uniform vec4 u_color;
+              uniform sampler2D u_logo;
+              uniform vec2 u_canvasResolution;
+
+              float hash(vec2 p) {
+                return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+              }
+
+              void main() {
+                // circular point
+                vec2 coord = gl_PointCoord - vec2(0.5);
+                float d = dot(coord, coord);
+                if (d > 0.25) discard;
+
+                // logo alpha in screen space
+                vec2 uvLogo = gl_FragCoord.xy / u_canvasResolution;
+                float aLogo = texture2D(u_logo, uvLogo).a;
+
+                // soft edge: fully discard far outside, fade near border
+                if (aLogo < 0.10) discard;
+                float edge = smoothstep(0.10, 0.45, aLogo);
+
+                // per-particle random factor (stable over time)
+                float r = hash(v_particleUv);
+                float brightness = 0.7 + 0.4 * r;        // 0.7–1.1
+                float alpha      = edge * (0.3 + 0.7*r); // 0.3–1.0, scaled by edge
+
+                vec4 base = u_color;
+                base.rgb *= brightness;
+                base.a *= alpha;
+
+                gl_FragColor = base;
+              }
+            `;
+
+            const renderProgram = createProgram(gl, renderVS, renderFS);
+            if (!renderProgram) return;
+            const renderUVLoc = gl.getAttribLocation(renderProgram, "a_uv");
+            const renderSizeLoc = gl.getAttribLocation(renderProgram, "a_size");
+            const renderStateLoc = gl.getUniformLocation(
+                renderProgram,
+                "u_state",
+            );
+            const renderCanvasResLoc = gl.getUniformLocation(
+                renderProgram,
+                "u_canvasResolution",
+            );
+            const renderColorLoc = gl.getUniformLocation(
+                renderProgram,
+                "u_color",
+            );
+            const renderLogoLoc = gl.getUniformLocation(
+                renderProgram,
+                "u_logo",
+            );
+
+            // --- Particle UVs (which texel each particle reads from in the state texture) ---
+
+            const particleUVs = new Float32Array(PARTICLE_COUNT * 2);
+            let ptr = 0;
+            for (let y = 0; y < SIM_SIZE; y++) {
+                for (let x = 0; x < SIM_SIZE; x++) {
+                    const u = (x + 0.5) / SIM_SIZE;
+                    const v = (y + 0.5) / SIM_SIZE;
+                    particleUVs[ptr++] = u;
+                    particleUVs[ptr++] = v;
+                }
+            }
+            const particleUVBuffer = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, particleUVBuffer);
+            gl.bufferData(gl.ARRAY_BUFFER, particleUVs, gl.STATIC_DRAW);
+
+            // --- Per-particle sizes ---
+
+            const particleSizes = new Float32Array(PARTICLE_COUNT);
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                // between 2px and 5px
+                particleSizes[i] = 2.0 + Math.random() * 5.0;
+            }
+            const particleSizeBuffer = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, particleSizeBuffer);
+            gl.bufferData(gl.ARRAY_BUFFER, particleSizes, gl.STATIC_DRAW);
+
+            // --- State textures + framebuffers (ping-pong) ---
+
+            function createStateTexture() {
+                const tex = gl.createTexture();
+                gl.bindTexture(gl.TEXTURE_2D, tex);
+                gl.texParameteri(
+                    gl.TEXTURE_2D,
+                    gl.TEXTURE_MIN_FILTER,
+                    gl.NEAREST,
+                );
+                gl.texParameteri(
+                    gl.TEXTURE_2D,
+                    gl.TEXTURE_MAG_FILTER,
+                    gl.NEAREST,
+                );
+                gl.texParameteri(
+                    gl.TEXTURE_2D,
+                    gl.TEXTURE_WRAP_S,
+                    gl.CLAMP_TO_EDGE,
+                );
+                gl.texParameteri(
+                    gl.TEXTURE_2D,
+                    gl.TEXTURE_WRAP_T,
+                    gl.CLAMP_TO_EDGE,
+                );
+
+                gl.texImage2D(
+                    gl.TEXTURE_2D,
+                    0,
+                    gl.RGBA,
+                    SIM_SIZE,
+                    SIM_SIZE,
+                    0,
+                    gl.RGBA,
+                    gl.FLOAT,
+                    null,
+                );
+                return tex;
+            }
+
+            function createFramebuffer(tex) {
+                const fb = gl.createFramebuffer();
+                gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+                gl.framebufferTexture2D(
+                    gl.FRAMEBUFFER,
+                    gl.COLOR_ATTACHMENT0,
+                    gl.TEXTURE_2D,
+                    tex,
+                    0,
+                );
+                const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+                if (status !== gl.FRAMEBUFFER_COMPLETE) {
+                    console.error(
+                        "Framebuffer not complete:",
+                        status.toString(16),
+                    );
+                }
+                gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+                return fb;
+            }
+
+            const stateTex0 = createStateTexture();
+            const stateTex1 = createStateTexture();
+            const fb0 = createFramebuffer(stateTex0);
+            const fb1 = createFramebuffer(stateTex1);
+
+            // Initialize state textures with random positions (0..1) and zero velocities
+            (function initState() {
+                const data = new Float32Array(SIM_SIZE * SIM_SIZE * 4);
+                for (let i = 0; i < SIM_SIZE * SIM_SIZE; i++) {
+                    const j = i * 4;
+                    data[j + 0] = Math.random(); // x
+                    data[j + 1] = Math.random(); // y
+                    data[j + 2] = 0.0; // vx
+                    data[j + 3] = 0.0; // vy
+                }
+
+                gl.bindTexture(gl.TEXTURE_2D, stateTex0);
+                gl.texImage2D(
+                    gl.TEXTURE_2D,
+                    0,
+                    gl.RGBA,
+                    SIM_SIZE,
+                    SIM_SIZE,
+                    0,
+                    gl.RGBA,
+                    gl.FLOAT,
+                    data,
+                );
+
+                gl.bindTexture(gl.TEXTURE_2D, stateTex1);
+                gl.texImage2D(
+                    gl.TEXTURE_2D,
+                    0,
+                    gl.RGBA,
+                    SIM_SIZE,
+                    SIM_SIZE,
+                    0,
+                    gl.RGBA,
+                    gl.FLOAT,
+                    data,
+                );
+            })();
+
+            // --- Logo texture ---
+
+            const logoTexture = gl.createTexture();
+            let logoReady = false;
+
+            function setupLogoTexture(image) {
+                gl.bindTexture(gl.TEXTURE_2D, logoTexture);
+                gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+                gl.texParameteri(
+                    gl.TEXTURE_2D,
+                    gl.TEXTURE_MIN_FILTER,
+                    gl.LINEAR,
+                );
+                gl.texParameteri(
+                    gl.TEXTURE_2D,
+                    gl.TEXTURE_MAG_FILTER,
+                    gl.LINEAR,
+                );
+                gl.texParameteri(
+                    gl.TEXTURE_2D,
+                    gl.TEXTURE_WRAP_S,
+                    gl.CLAMP_TO_EDGE,
+                );
+                gl.texParameteri(
+                    gl.TEXTURE_2D,
+                    gl.TEXTURE_WRAP_T,
+                    gl.CLAMP_TO_EDGE,
+                );
+
+                gl.texImage2D(
+                    gl.TEXTURE_2D,
+                    0,
+                    gl.RGBA,
+                    gl.RGBA,
+                    gl.UNSIGNED_BYTE,
+                    image,
+                );
+
+                logoReady = true;
+            }
+
+            const img = new Image();
+            img.onload = function () {
+                setupLogoTexture(img);
+                start();
+            };
+            img.onerror = function (e) {
+                console.error("Failed to load logo image", e);
+            };
+            img.src = LOGO_SRC;
+
+            // --- Main loop: ping-pong simulation + render ---
+
+            let readTex = stateTex0;
+            let writeTex = stateTex1;
+            let readFB = fb0;
+            let writeFB = fb1;
+            let lastTime = 0;
+
+            function swapStates() {
+                let tmpTex = readTex;
+                readTex = writeTex;
+                writeTex = tmpTex;
+
+                let tmpFB = readFB;
+                readFB = writeFB;
+                writeFB = tmpFB;
+            }
+
+            function start() {
+                if (!logoReady) return;
+                requestAnimationFrame(loop);
+            }
+
+            function loop(timestamp) {
+                if (!lastTime) lastTime = timestamp;
+                const dtMs = timestamp - lastTime;
+                lastTime = timestamp;
+                const dt = dtMs / 1000;
+                const clampedDt = Math.min(dt, 0.033);
+
+                resizeCanvas(); // in case of resize
+                const width = canvas.width;
+                const height = canvas.height;
+
+                // --- 1) SIMULATION PASS (to writeFB) ---
+                gl.bindFramebuffer(gl.FRAMEBUFFER, writeFB);
+                gl.viewport(0, 0, SIM_SIZE, SIM_SIZE);
+
+                gl.useProgram(simProgram);
+
+                gl.bindBuffer(gl.ARRAY_BUFFER, quadVBO);
+                gl.enableVertexAttribArray(simPosLoc);
+                gl.vertexAttribPointer(simPosLoc, 2, gl.FLOAT, false, 0, 0);
+
+                gl.activeTexture(gl.TEXTURE0);
+                gl.bindTexture(gl.TEXTURE_2D, readTex);
+                gl.uniform1i(simStatePrevLoc, 0);
+
+                gl.activeTexture(gl.TEXTURE1);
+                gl.bindTexture(gl.TEXTURE_2D, logoTexture);
+                gl.uniform1i(simLogoLoc, 1);
+
+                gl.uniform2f(simCanvasResLoc, width, height);
+                gl.uniform1f(simDtLoc, clampedDt);
+
+                gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+                gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+                swapStates();
+
+                // --- 2) RENDER PASS ---
+                gl.viewport(0, 0, width, height);
+                gl.clearColor(0.0, 0.0, 0.0, 0.0);
+                gl.clear(gl.COLOR_BUFFER_BIT);
+
+                gl.useProgram(renderProgram);
+
+                // state texture in unit 0
+                gl.activeTexture(gl.TEXTURE0);
+                gl.bindTexture(gl.TEXTURE_2D, readTex);
+                gl.uniform1i(renderStateLoc, 0);
+
+                // logo texture in unit 1
+                gl.activeTexture(gl.TEXTURE1);
+                gl.bindTexture(gl.TEXTURE_2D, logoTexture);
+                gl.uniform1i(renderLogoLoc, 1);
+
+                gl.uniform2f(renderCanvasResLoc, width, height);
+
+                // greenish color
+                gl.uniform4f(renderColorLoc, 0.4, 0.9, 0.5, 1.0);
+
+                // UV attribute
+                gl.bindBuffer(gl.ARRAY_BUFFER, particleUVBuffer);
+                gl.enableVertexAttribArray(renderUVLoc);
+                gl.vertexAttribPointer(renderUVLoc, 2, gl.FLOAT, false, 0, 0);
+
+                // size attribute
+                gl.bindBuffer(gl.ARRAY_BUFFER, particleSizeBuffer);
+                gl.enableVertexAttribArray(renderSizeLoc);
+                gl.vertexAttribPointer(renderSizeLoc, 1, gl.FLOAT, false, 0, 0);
+
+                gl.drawArrays(gl.POINTS, 0, PARTICLE_COUNT);
+
+                requestAnimationFrame(loop);
+            }
+        })();
+    </script>
+</html>
