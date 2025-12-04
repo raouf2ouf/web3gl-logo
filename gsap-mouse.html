@@ -37,7 +37,6 @@
                 display: flex;
                 align-items: center;
                 justify-content: center;
-                /* so parallax transform has room without clipping */
                 overflow: visible;
                 will-change: transform;
             }
@@ -68,29 +67,41 @@
             (function () {
                 const CONTAINER_ID = "logo-particles";
                 const LOGICAL_SIZE = 640; // internal canvas coordinate system
-                const PARTICLE_COUNT = 2400; // similar density to tsParticles example
-                const MASK_SRC = "cork-tech-logo.svg"; // <-- make sure this file exists
+                const PARTICLE_COUNT = 2400;
+                const MASK_SRC = "cork-tech-logo.svg"; // must live next to this HTML
 
                 // Sampling & visual config
-                const PIXEL_STEP = 4; // sample every N pixels in mask
-                const FLOAT_AMPLITUDE = 10; // px drift radius around home position
-                const FLOAT_DURATION_MIN = 2;
-                const FLOAT_DURATION_VAR = 2;
+                const PIXEL_STEP = 4;
+                const FLOAT_AMPLITUDE = 10; // more noticeable idle float
+                const FLOAT_DURATION_MIN = 2.5; // slightly faster drift
+                const FLOAT_DURATION_VAR = 3.5;
                 const DOT_SIZE_MIN = 1;
                 const DOT_SIZE_MAX = 3;
-                const DOT_COLOR = "#87ca7a";
+                const DOT_COLOR = "rgba(135, 202, 122, 0.85)"; // Cork green glow
                 const OPACITY_MIN = 0.4;
                 const OPACITY_MAX = 1.0;
 
-                // Hover “bubble” config
-                const BUBBLE_RADIUS = 100; // logical px
-                const BUBBLE_SIZE_MULT = 2; // how much bigger near cursor
-                const BUBBLE_OPACITY_BOOST = 0.4;
-                const BUBBLE_EASING = 0.15;
+                // Hover “bubble” config (soft)
+                const BUBBLE_RADIUS = 100;
+                const BUBBLE_SIZE_MULT = 1.0;
+                const BUBBLE_OPACITY_BOOST = 0.25;
+                const BUBBLE_EASING = 0.1;
 
                 // Parallax (move whole logo-shell)
-                const PARALLAX_STRENGTH = 60; // px at screen edges
-                const PARALLAX_EASING = 0.1;
+                const PARALLAX_STRENGTH = 40;
+                const PARALLAX_EASING = 0.12;
+
+                // Slow shape drift of the silhouette – more movement at rest
+                const SHAPE_DRIFT_AMPLITUDE = 6;
+
+                // Mouse-flow (direction-based movement)
+                const FLOW_INTENSITY = 0.12;
+                const FLOW_DECAY = 0.93;
+                const FLOW_MAX = 12;
+                const FLOW_STEP_MAX = 8;
+
+                // Global breathing state for the shell
+                const shellTransformState = { scale: 1, rotate: 0 };
 
                 const prefersReducedMotion =
                     window.matchMedia &&
@@ -100,10 +111,8 @@
                 const container = document.getElementById(CONTAINER_ID);
                 if (!container) return;
 
-                // Parent for parallax transform
                 const shell = container.closest(".logo-shell") || container;
 
-                // Canvas setup
                 const canvas = document.createElement("canvas");
                 container.appendChild(canvas);
                 const ctx = canvas.getContext("2d");
@@ -114,7 +123,7 @@
                     dpr = window.devicePixelRatio || 1;
                     canvas.width = LOGICAL_SIZE * dpr;
                     canvas.height = LOGICAL_SIZE * dpr;
-                    ctx.setTransform(dpr, 0, 0, dpr, 0, 0); // draw in 640×640 space
+                    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
                 }
 
                 resizeCanvas();
@@ -125,13 +134,17 @@
                 let parallax = { x: 0, y: 0 };
                 let targetParallax = { x: 0, y: 0 };
 
+                // Mouse-flow state
+                let flow = { x: 0, y: 0 };
+                let lastMouse = { x: null, y: null };
+
                 // ─────────────────────────────
                 // Load SVG mask and sample points
                 // ─────────────────────────────
                 function loadMaskAndInit() {
                     const img = new Image();
                     img.src = MASK_SRC;
-                    img.crossOrigin = "anonymous"; // fine if same-origin; harmless otherwise
+                    img.crossOrigin = "anonymous";
 
                     img.onload = () => {
                         const maskCanvas = document.createElement("canvas");
@@ -139,7 +152,6 @@
                         maskCanvas.height = LOGICAL_SIZE;
                         const maskCtx = maskCanvas.getContext("2d");
 
-                        // Fit SVG into 640×640, centered (like object-fit: contain)
                         const scale = Math.min(
                             LOGICAL_SIZE / img.width,
                             LOGICAL_SIZE / img.height,
@@ -173,7 +185,6 @@
 
                         if (!maskPoints.length) return;
 
-                        // Create particle objects
                         for (let i = 0; i < PARTICLE_COUNT; i++) {
                             const p =
                                 maskPoints[
@@ -191,6 +202,8 @@
                             particles.push({
                                 homeX: p.x,
                                 homeY: p.y,
+                                homeOffsetX: 0,
+                                homeOffsetY: 0,
                                 offsetX: 0,
                                 offsetY: 0,
                                 size,
@@ -199,6 +212,7 @@
                                 opacity: baseOpacity,
                                 bubbleFactor: 0,
                                 bubbleTarget: 0,
+                                flowFactor: 0.5 + Math.random() * 0.5,
                             });
                         }
 
@@ -209,7 +223,7 @@
                 }
 
                 // ─────────────────────────────
-                // GSAP tweens for float & flicker
+                // GSAP tweens: float, flicker, drift, breathing
                 // ─────────────────────────────
                 function initTweens() {
                     if (prefersReducedMotion) {
@@ -226,7 +240,7 @@
                     }
 
                     particles.forEach((p) => {
-                        // Float motion
+                        // noticeable idle float
                         gsap.to(p, {
                             offsetX: `random(-${FLOAT_AMPLITUDE}, ${FLOAT_AMPLITUDE})`,
                             offsetY: `random(-${FLOAT_AMPLITUDE}, ${FLOAT_AMPLITUDE})`,
@@ -238,23 +252,50 @@
                             ease: "sine.inOut",
                         });
 
-                        // Size + opacity breathing
+                        // Gentle size + opacity breathing
                         gsap.to(p, {
                             size: () =>
-                                p.baseSize * (0.8 + Math.random() * 0.4),
+                                p.baseSize * (0.9 + Math.random() * 0.2),
                             opacity: () =>
                                 OPACITY_MIN +
-                                Math.random() * (OPACITY_MAX - OPACITY_MIN),
-                            duration: 2 + Math.random() * 2,
+                                Math.random() *
+                                    (OPACITY_MAX - OPACITY_MAX * 0.3),
+                            duration: 3 + Math.random() * 2,
+                            repeat: -1,
+                            yoyo: true,
+                            ease: "sine.inOut",
+                        });
+
+                        // Stronger silhouette drift – more “alive” at rest
+                        gsap.to(p, {
+                            homeOffsetX: `random(-${SHAPE_DRIFT_AMPLITUDE}, ${SHAPE_DRIFT_AMPLITUDE})`,
+                            homeOffsetY: `random(-${SHAPE_DRIFT_AMPLITUDE}, ${SHAPE_DRIFT_AMPLITUDE})`,
+                            duration: 8 + Math.random() * 10,
                             repeat: -1,
                             yoyo: true,
                             ease: "sine.inOut",
                         });
                     });
+
+                    gsap.to(shellTransformState, {
+                        scale: 1.02,
+                        duration: 7,
+                        repeat: -1,
+                        yoyo: true,
+                        ease: "sine.inOut",
+                    });
+
+                    gsap.to(shellTransformState, {
+                        rotate: 2.5,
+                        duration: 11,
+                        repeat: -1,
+                        yoyo: true,
+                        ease: "sine.inOut",
+                    });
                 }
 
                 // ─────────────────────────────
-                // Hover bubble + parallax
+                // Hover bubble + parallax + mouse-flow (with clamped steps)
                 // ─────────────────────────────
                 function initInteractivity() {
                     document.addEventListener("mousemove", (e) => {
@@ -268,11 +309,41 @@
                         pointer.x = nx;
                         pointer.y = ny;
 
-                        // parallax target based on viewport pos
                         const vpX = e.clientX / window.innerWidth - 0.5;
                         const vpY = e.clientY / window.innerHeight - 0.5;
                         targetParallax.x = vpX * PARALLAX_STRENGTH;
                         targetParallax.y = vpY * PARALLAX_STRENGTH;
+
+                        if (lastMouse.x != null && lastMouse.y != null) {
+                            let dx = e.clientX - lastMouse.x;
+                            let dy = e.clientY - lastMouse.y;
+
+                            const scaleX = LOGICAL_SIZE / rect.width;
+                            const scaleY = LOGICAL_SIZE / rect.height;
+
+                            let stepX = dx * scaleX;
+                            let stepY = dy * scaleY;
+
+                            const stepMag = Math.hypot(stepX, stepY);
+                            if (stepMag > FLOW_STEP_MAX) {
+                                const s = FLOW_STEP_MAX / stepMag;
+                                stepX *= s;
+                                stepY *= s;
+                            }
+
+                            flow.x += stepX * FLOW_INTENSITY;
+                            flow.y += stepY * FLOW_INTENSITY;
+
+                            const mag = Math.hypot(flow.x, flow.y);
+                            if (mag > FLOW_MAX) {
+                                const s = FLOW_MAX / mag;
+                                flow.x *= s;
+                                flow.y *= s;
+                            }
+                        }
+
+                        lastMouse.x = e.clientX;
+                        lastMouse.y = e.clientY;
                     });
 
                     document.addEventListener("mouseleave", () => {
@@ -280,6 +351,8 @@
                         pointer.y = null;
                         targetParallax.x = 0;
                         targetParallax.y = 0;
+                        lastMouse.x = null;
+                        lastMouse.y = null;
                     });
                 }
 
@@ -289,27 +362,39 @@
                 function render() {
                     if (!particles.length) return;
 
-                    // Smooth parallax
                     parallax.x +=
                         (targetParallax.x - parallax.x) * PARALLAX_EASING;
                     parallax.y +=
                         (targetParallax.y - parallax.y) * PARALLAX_EASING;
-                    shell.style.transform = `translate3d(${parallax.x}px, ${parallax.y}px, 0)`;
+
+                    flow.x *= FLOW_DECAY;
+                    flow.y *= FLOW_DECAY;
+
+                    shell.style.transform =
+                        `translate3d(${parallax.x}px, ${parallax.y}px, 0) ` +
+                        `rotate(${shellTransformState.rotate}deg) ` +
+                        `scale(${shellTransformState.scale})`;
 
                     ctx.clearRect(0, 0, LOGICAL_SIZE, LOGICAL_SIZE);
                     ctx.fillStyle = DOT_COLOR;
 
                     for (const p of particles) {
-                        // Bubble effect based on pointer
+                        const baseX = p.homeX + p.homeOffsetX + p.offsetX;
+                        const baseY = p.homeY + p.homeOffsetY + p.offsetY;
+
+                        const flowX = flow.x * p.flowFactor;
+                        const flowY = flow.y * p.flowFactor;
+
+                        const flowXPos = baseX + flowX;
+                        const flowYPos = baseY + flowY;
+
                         if (
                             pointer.x != null &&
                             pointer.y != null &&
                             !prefersReducedMotion
                         ) {
-                            const x = p.homeX + p.offsetX;
-                            const y = p.homeY + p.offsetY;
-                            const dx = x - pointer.x;
-                            const dy = y - pointer.y;
+                            const dx = flowXPos - pointer.x;
+                            const dy = flowYPos - pointer.y;
                             const dist = Math.sqrt(dx * dx + dy * dy);
 
                             let influence = 0;
@@ -321,12 +406,11 @@
                             p.bubbleTarget = 0;
                         }
 
-                        // Smooth bubble factor
                         p.bubbleFactor +=
                             (p.bubbleTarget - p.bubbleFactor) * BUBBLE_EASING;
 
-                        const x = p.homeX + p.offsetX;
-                        const y = p.homeY + p.offsetY;
+                        const x = flowXPos;
+                        const y = flowYPos;
                         const size =
                             p.size * (1 + BUBBLE_SIZE_MULT * p.bubbleFactor);
                         const opacity = Math.min(
