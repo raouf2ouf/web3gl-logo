@@ -1,0 +1,350 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <title>Cork Tech – GSAP Canvas Logo Particles</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+        <style>
+            :root {
+                color-scheme: dark;
+            }
+
+            * {
+                box-sizing: border-box;
+            }
+
+            body {
+                margin: 0;
+                min-height: 100vh;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                background: #050608;
+                color: #fff;
+                font-family:
+                    system-ui,
+                    -apple-system,
+                    BlinkMacSystemFont,
+                    "SF Pro Text",
+                    "Segoe UI",
+                    sans-serif;
+            }
+
+            .logo-shell {
+                width: min(420px, 80vw);
+                aspect-ratio: 1 / 1;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                /* so parallax transform has room without clipping */
+                overflow: visible;
+                will-change: transform;
+            }
+
+            #logo-particles {
+                position: relative;
+                width: 100%;
+                height: 100%;
+            }
+
+            #logo-particles canvas {
+                width: 100%;
+                height: auto;
+                aspect-ratio: 1 / 1;
+                display: block;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="logo-shell">
+            <div id="logo-particles"></div>
+        </div>
+
+        <!-- GSAP core -->
+        <script src="https://cdn.jsdelivr.net/npm/gsap@3.13.0/dist/gsap.min.js"></script>
+
+        <script>
+            (function () {
+                const CONTAINER_ID = "logo-particles";
+                const LOGICAL_SIZE = 640; // internal canvas coordinate system
+                const PARTICLE_COUNT = 2400; // similar density to tsParticles example
+                const MASK_SRC = "cork-tech-logo.svg"; // <-- make sure this file exists
+
+                // Sampling & visual config
+                const PIXEL_STEP = 4; // sample every N pixels in mask
+                const FLOAT_AMPLITUDE = 10; // px drift radius around home position
+                const FLOAT_DURATION_MIN = 2;
+                const FLOAT_DURATION_VAR = 2;
+                const DOT_SIZE_MIN = 1;
+                const DOT_SIZE_MAX = 3;
+                const DOT_COLOR = "#87ca7a";
+                const OPACITY_MIN = 0.4;
+                const OPACITY_MAX = 1.0;
+
+                // Hover “bubble” config
+                const BUBBLE_RADIUS = 100; // logical px
+                const BUBBLE_SIZE_MULT = 2; // how much bigger near cursor
+                const BUBBLE_OPACITY_BOOST = 0.4;
+                const BUBBLE_EASING = 0.15;
+
+                // Parallax (move whole logo-shell)
+                const PARALLAX_STRENGTH = 60; // px at screen edges
+                const PARALLAX_EASING = 0.1;
+
+                const prefersReducedMotion =
+                    window.matchMedia &&
+                    window.matchMedia("(prefers-reduced-motion: reduce)")
+                        .matches;
+
+                const container = document.getElementById(CONTAINER_ID);
+                if (!container) return;
+
+                // Parent for parallax transform
+                const shell = container.closest(".logo-shell") || container;
+
+                // Canvas setup
+                const canvas = document.createElement("canvas");
+                container.appendChild(canvas);
+                const ctx = canvas.getContext("2d");
+
+                let dpr = window.devicePixelRatio || 1;
+
+                function resizeCanvas() {
+                    dpr = window.devicePixelRatio || 1;
+                    canvas.width = LOGICAL_SIZE * dpr;
+                    canvas.height = LOGICAL_SIZE * dpr;
+                    ctx.setTransform(dpr, 0, 0, dpr, 0, 0); // draw in 640×640 space
+                }
+
+                resizeCanvas();
+                window.addEventListener("resize", resizeCanvas);
+
+                const particles = [];
+                let pointer = { x: null, y: null };
+                let parallax = { x: 0, y: 0 };
+                let targetParallax = { x: 0, y: 0 };
+
+                // ─────────────────────────────
+                // Load SVG mask and sample points
+                // ─────────────────────────────
+                function loadMaskAndInit() {
+                    const img = new Image();
+                    img.src = MASK_SRC;
+                    img.crossOrigin = "anonymous"; // fine if same-origin; harmless otherwise
+
+                    img.onload = () => {
+                        const maskCanvas = document.createElement("canvas");
+                        maskCanvas.width = LOGICAL_SIZE;
+                        maskCanvas.height = LOGICAL_SIZE;
+                        const maskCtx = maskCanvas.getContext("2d");
+
+                        // Fit SVG into 640×640, centered (like object-fit: contain)
+                        const scale = Math.min(
+                            LOGICAL_SIZE / img.width,
+                            LOGICAL_SIZE / img.height,
+                        );
+                        const drawW = img.width * scale;
+                        const drawH = img.height * scale;
+                        const offsetX = (LOGICAL_SIZE - drawW) / 2;
+                        const offsetY = (LOGICAL_SIZE - drawH) / 2;
+
+                        maskCtx.clearRect(0, 0, LOGICAL_SIZE, LOGICAL_SIZE);
+                        maskCtx.drawImage(img, offsetX, offsetY, drawW, drawH);
+
+                        const imageData = maskCtx.getImageData(
+                            0,
+                            0,
+                            LOGICAL_SIZE,
+                            LOGICAL_SIZE,
+                        );
+                        const data = imageData.data;
+
+                        const maskPoints = [];
+                        for (let y = 0; y < LOGICAL_SIZE; y += PIXEL_STEP) {
+                            for (let x = 0; x < LOGICAL_SIZE; x += PIXEL_STEP) {
+                                const idx = (y * LOGICAL_SIZE + x) * 4;
+                                const alpha = data[idx + 3];
+                                if (alpha > 128) {
+                                    maskPoints.push({ x, y });
+                                }
+                            }
+                        }
+
+                        if (!maskPoints.length) return;
+
+                        // Create particle objects
+                        for (let i = 0; i < PARTICLE_COUNT; i++) {
+                            const p =
+                                maskPoints[
+                                    Math.floor(
+                                        Math.random() * maskPoints.length,
+                                    )
+                                ];
+                            const size =
+                                DOT_SIZE_MIN +
+                                Math.random() * (DOT_SIZE_MAX - DOT_SIZE_MIN);
+                            const baseOpacity =
+                                OPACITY_MIN +
+                                Math.random() * (OPACITY_MAX - OPACITY_MIN);
+
+                            particles.push({
+                                homeX: p.x,
+                                homeY: p.y,
+                                offsetX: 0,
+                                offsetY: 0,
+                                size,
+                                baseSize: size,
+                                baseOpacity,
+                                opacity: baseOpacity,
+                                bubbleFactor: 0,
+                                bubbleTarget: 0,
+                            });
+                        }
+
+                        initTweens();
+                        initInteractivity();
+                        gsap.ticker.add(render);
+                    };
+                }
+
+                // ─────────────────────────────
+                // GSAP tweens for float & flicker
+                // ─────────────────────────────
+                function initTweens() {
+                    if (prefersReducedMotion) {
+                        particles.forEach((p) => {
+                            gsap.to(p, {
+                                opacity: p.baseOpacity,
+                                duration: 2,
+                                repeat: -1,
+                                yoyo: true,
+                                ease: "sine.inOut",
+                            });
+                        });
+                        return;
+                    }
+
+                    particles.forEach((p) => {
+                        // Float motion
+                        gsap.to(p, {
+                            offsetX: `random(-${FLOAT_AMPLITUDE}, ${FLOAT_AMPLITUDE})`,
+                            offsetY: `random(-${FLOAT_AMPLITUDE}, ${FLOAT_AMPLITUDE})`,
+                            duration:
+                                FLOAT_DURATION_MIN +
+                                Math.random() * FLOAT_DURATION_VAR,
+                            repeat: -1,
+                            yoyo: true,
+                            ease: "sine.inOut",
+                        });
+
+                        // Size + opacity breathing
+                        gsap.to(p, {
+                            size: () =>
+                                p.baseSize * (0.8 + Math.random() * 0.4),
+                            opacity: () =>
+                                OPACITY_MIN +
+                                Math.random() * (OPACITY_MAX - OPACITY_MIN),
+                            duration: 2 + Math.random() * 2,
+                            repeat: -1,
+                            yoyo: true,
+                            ease: "sine.inOut",
+                        });
+                    });
+                }
+
+                // ─────────────────────────────
+                // Hover bubble + parallax
+                // ─────────────────────────────
+                function initInteractivity() {
+                    document.addEventListener("mousemove", (e) => {
+                        const rect = canvas.getBoundingClientRect();
+                        const nx =
+                            ((e.clientX - rect.left) / rect.width) *
+                            LOGICAL_SIZE;
+                        const ny =
+                            ((e.clientY - rect.top) / rect.height) *
+                            LOGICAL_SIZE;
+                        pointer.x = nx;
+                        pointer.y = ny;
+
+                        // parallax target based on viewport pos
+                        const vpX = e.clientX / window.innerWidth - 0.5;
+                        const vpY = e.clientY / window.innerHeight - 0.5;
+                        targetParallax.x = vpX * PARALLAX_STRENGTH;
+                        targetParallax.y = vpY * PARALLAX_STRENGTH;
+                    });
+
+                    document.addEventListener("mouseleave", () => {
+                        pointer.x = null;
+                        pointer.y = null;
+                        targetParallax.x = 0;
+                        targetParallax.y = 0;
+                    });
+                }
+
+                // ─────────────────────────────
+                // Render loop
+                // ─────────────────────────────
+                function render() {
+                    if (!particles.length) return;
+
+                    // Smooth parallax
+                    parallax.x +=
+                        (targetParallax.x - parallax.x) * PARALLAX_EASING;
+                    parallax.y +=
+                        (targetParallax.y - parallax.y) * PARALLAX_EASING;
+                    shell.style.transform = `translate3d(${parallax.x}px, ${parallax.y}px, 0)`;
+
+                    ctx.clearRect(0, 0, LOGICAL_SIZE, LOGICAL_SIZE);
+                    ctx.fillStyle = DOT_COLOR;
+
+                    for (const p of particles) {
+                        // Bubble effect based on pointer
+                        if (
+                            pointer.x != null &&
+                            pointer.y != null &&
+                            !prefersReducedMotion
+                        ) {
+                            const x = p.homeX + p.offsetX;
+                            const y = p.homeY + p.offsetY;
+                            const dx = x - pointer.x;
+                            const dy = y - pointer.y;
+                            const dist = Math.sqrt(dx * dx + dy * dy);
+
+                            let influence = 0;
+                            if (dist < BUBBLE_RADIUS) {
+                                influence = 1 - dist / BUBBLE_RADIUS;
+                            }
+                            p.bubbleTarget = influence;
+                        } else {
+                            p.bubbleTarget = 0;
+                        }
+
+                        // Smooth bubble factor
+                        p.bubbleFactor +=
+                            (p.bubbleTarget - p.bubbleFactor) * BUBBLE_EASING;
+
+                        const x = p.homeX + p.offsetX;
+                        const y = p.homeY + p.offsetY;
+                        const size =
+                            p.size * (1 + BUBBLE_SIZE_MULT * p.bubbleFactor);
+                        const opacity = Math.min(
+                            1,
+                            p.opacity + BUBBLE_OPACITY_BOOST * p.bubbleFactor,
+                        );
+
+                        ctx.globalAlpha = opacity;
+                        ctx.beginPath();
+                        ctx.arc(x, y, size, 0, Math.PI * 2);
+                        ctx.fill();
+                    }
+
+                    ctx.globalAlpha = 1;
+                }
+
+                loadMaskAndInit();
+            })();
+        </script>
+    </body>
+</html>
